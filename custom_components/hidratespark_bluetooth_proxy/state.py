@@ -91,6 +91,21 @@ class BottleState:
         self._refills_today = int(data.get("refills_today") or 0)
         self.weight_full_low = data.get("weight_full_low")
 
+        # Restore the recent-sip dedup window. Without this, a HA restart
+        # empties the dedup history, and the bottle's initial drain replays its
+        # buffered sips as brand-new ones — double-counting into the persisted
+        # lifetime/today totals.
+        for raw in data.get("recent_sips") or []:
+            try:
+                self.sips.append(
+                    Sip(timestamp=float(raw["timestamp"]), volume_ml=int(raw["volume_ml"]))
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        if self.sips:
+            self.last_sip = max(self.sips, key=lambda s: s.timestamp)
+            self.last_seen = self.last_sip.timestamp
+
     async def async_save(self) -> None:
         await self._store.async_save(
             {
@@ -102,6 +117,12 @@ class BottleState:
                 "sips_today": self._sips_today,
                 "refills_today": self._refills_today,
                 "weight_full_low": self.weight_full_low,
+                # Persist the dedup window so replays after a restart are
+                # recognised as duplicates rather than re-counted.
+                "recent_sips": [
+                    {"timestamp": s.timestamp, "volume_ml": s.volume_ml}
+                    for s in list(self.sips)[-SIP_DEDUP_WINDOW:]
+                ],
             }
         )
 

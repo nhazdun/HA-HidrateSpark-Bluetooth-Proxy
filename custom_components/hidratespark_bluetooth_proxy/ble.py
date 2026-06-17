@@ -32,6 +32,7 @@ from .const import (
     DRAIN_BYTE,
     HANDSHAKE_COMMANDS,
     HANDSHAKE_INTERVAL_S,
+    MAX_IDENTICAL_SIP_FRAMES,
     REFILL_MIN_DELTA,
     REFILL_SETTLE_TIMEOUT_S,
     REFILL_STABLE_SAMPLES,
@@ -85,6 +86,12 @@ class BottleClient:
         self._connected = False
         self._handshake_path: Optional[str] = None
         self._data_char: Optional[str] = None
+
+        # Inline re-drain loop guard: track the last sip frame and how many
+        # times it has repeated, so we stop acking a record the firmware never
+        # pops instead of spinning in a write loop.
+        self._last_frame_hex: Optional[str] = None
+        self._frame_repeat = 0
 
         # Refill detection state
         self._weight_stable_low: Optional[int] = None
@@ -295,12 +302,30 @@ class BottleClient:
         # An empty-queue announcement: nothing to parse, no need to re-drain.
         if remaining == 0:
             _LOGGER.debug("sip frame: queue empty")
+            self._last_frame_hex = None
+            self._frame_repeat = 0
             return
 
+        # Track identical consecutive frames so a record the firmware never
+        # pops can't trap us in an unbounded re-drain (write) loop.
+        frame_hex = data.hex()
+        if frame_hex == self._last_frame_hex:
+            self._frame_repeat += 1
+        else:
+            self._frame_repeat = 0
+        self._last_frame_hex = frame_hex
+
         # Re-drain immediately so the bottle pushes the next record. Some
-        # firmwares first send a short "N pending" frame and only emit the
-        # real record after the next 0x57.
-        if self._client and self._client.is_connected:
+        # firmwares first send a short "N pending" frame and only emit the real
+        # record after the next 0x57. Skip the ack once the same frame has
+        # repeated too many times — the bottle isn't advancing its queue.
+        if self._frame_repeat >= MAX_IDENTICAL_SIP_FRAMES:
+            _LOGGER.warning(
+                "sip frame repeated %d×; pausing re-drain to avoid a write loop: %s",
+                self._frame_repeat + 1,
+                frame_hex,
+            )
+        elif self._client and self._client.is_connected:
             try:
                 await self._drain(self._client)
             except Exception as err:  # noqa: BLE001
@@ -318,9 +343,14 @@ class BottleClient:
             _LOGGER.debug("malformed sip frame %s: %s", data.hex(), err)
             return
 
-        # Sanity clamp: ignore obviously bogus seconds-ago (> 10 years).
+        # Drop frames with an obviously bogus seconds-ago (> 10 years) rather
+        # than fabricating a present-time sip from corrupt data.
         if seconds_ago > 10 * 365 * 24 * 3600:
-            seconds_ago = 0
+            _LOGGER.debug(
+                "dropping sip frame with bogus seconds-ago=%d: %s",
+                seconds_ago, data.hex(),
+            )
+            return
         ts = time.time() - seconds_ago
         volume_ml = round(self.size_ml * pct / 100)
 
