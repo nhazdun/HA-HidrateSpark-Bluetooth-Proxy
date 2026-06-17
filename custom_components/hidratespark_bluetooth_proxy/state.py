@@ -197,16 +197,26 @@ class BottleState:
             ):
                 return False
 
-        # Day rollover keyed on HA's configured local timezone so 'today'
-        # matches the user's wall clock (including DST).
-        self._maybe_rollover(sip.timestamp)
+        # Day rollover is keyed on wall-clock *now* (in HA's configured local
+        # timezone), never on the sip's own timestamp. Buffered sips replayed
+        # on reconnect carry old timestamps; keying rollover off them would roll
+        # 'today' backwards and zero the daily counters (issue #4).
+        self._maybe_rollover()
 
         self.sips.append(sip)
-        self.last_sip = sip
         self.lifetime_total_ml += sip.volume_ml
-        self._total_today_ml += sip.volume_ml
-        self._sips_today += 1
-        self.last_seen = sip.timestamp
+
+        # Only count toward 'today' if the sip actually falls on today's local
+        # date. Historical/replayed sips still contribute to the lifetime total.
+        if self._local_date_str(sip.timestamp) == self._today_date:
+            self._total_today_ml += sip.volume_ml
+            self._sips_today += 1
+
+        # 'Last sip' / 'last seen' advance forward only, so a replayed old frame
+        # can't make the last-sip sensor jump backwards (issue #4).
+        if self.last_sip is None or sip.timestamp >= self.last_sip.timestamp:
+            self.last_sip = sip
+            self.last_seen = sip.timestamp
 
         # Sip-exceeds-fill: bottle was clearly refilled out-of-band.
         if self.weight_full_low is None and sip.volume_ml > self.current_fill_ml:
