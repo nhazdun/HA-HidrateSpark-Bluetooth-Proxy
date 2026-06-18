@@ -20,6 +20,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    RAW_UNITS_PER_ML,
     SIP_DEDUP_TIMESTAMP_TOLERANCE_S,
     SIP_DEDUP_WINDOW,
     STORAGE_KEY_PREFIX,
@@ -74,9 +75,9 @@ class BottleState:
         self._sips_today: int = 0
         self._refills_today: int = 0
 
-        # Weight calibration: low-byte value at "full".
-        self.weight_full_low: Optional[int] = None
-        self.weight_low: Optional[int] = None  # most recent stable low byte
+        # Weight calibration: 16-bit raw weight value at "full".
+        self.weight_full_raw: Optional[int] = None
+        self.weight_raw: Optional[int] = None  # most recent stable u16 reading
 
     # ----------------------------------------------------------- persistence
 
@@ -89,7 +90,7 @@ class BottleState:
         self._total_today_ml = int(data.get("total_today_ml") or 0)
         self._sips_today = int(data.get("sips_today") or 0)
         self._refills_today = int(data.get("refills_today") or 0)
-        self.weight_full_low = data.get("weight_full_low")
+        self.weight_full_raw = data.get("weight_full_raw")
 
         # Restore the recent-sip dedup window. Without this, a HA restart
         # empties the dedup history, and the bottle's initial drain replays its
@@ -116,7 +117,7 @@ class BottleState:
                 "total_today_ml": self._total_today_ml,
                 "sips_today": self._sips_today,
                 "refills_today": self._refills_today,
-                "weight_full_low": self.weight_full_low,
+                "weight_full_raw": self.weight_full_raw,
                 # Persist the dedup window so replays after a restart are
                 # recognised as duplicates rather than re-counted.
                 "recent_sips": [
@@ -155,32 +156,46 @@ class BottleState:
             self._sips_today = 0
             self._refills_today = 0
 
-    def refill(self, source: str, weight_full_low: Optional[int]) -> None:
+    def refill(self, source: str, weight_full_raw: Optional[int]) -> None:
         self._maybe_rollover()
         self.current_fill_ml = self.bottle_size_ml
         self.last_refill_ts = time.time()
-        self._refills_today += 1
-        if weight_full_low is not None:
-            self.weight_full_low = weight_full_low
+        # A "calibration" is the one-time bootstrap that establishes the full-
+        # weight anchor (bottle assumed full); it isn't a user refill, so it
+        # doesn't bump the daily refill counter.
+        if source != "calibration":
+            self._refills_today += 1
+        if weight_full_raw is not None:
+            self.weight_full_raw = weight_full_raw
         _LOGGER.info(
             "REFILL (%s): fill=%dml anchor=%s refills_today=%d",
             source,
             self.current_fill_ml,
-            self.weight_full_low,
+            self.weight_full_raw,
             self._refills_today,
         )
 
-    def update_fill_from_weight(self, low_byte: int) -> bool:
-        """Recompute current fill from a stable upright weight reading.
+    def update_fill_from_weight(self, raw: int) -> bool:
+        """Recompute current fill from a stable upright 16-bit weight reading.
 
+        The reading rises with the water level, so the drop from the "full"
+        anchor, scaled by RAW_UNITS_PER_ML, gives how much has been drunk.
         Returns True if current_fill_ml changed.
         """
-        self.weight_low = low_byte
-        if self.weight_full_low is None:
-            # No anchor yet — sip-decrement estimate stays in effect.
-            return False
-        delta = self.weight_full_low - low_byte  # positive when drunk
-        new_fill = max(0, min(self.bottle_size_ml, self.bottle_size_ml - delta))
+        self.weight_raw = raw
+        if self.weight_full_raw is None:
+            # Bootstrap: the first settled reading establishes the full-weight
+            # anchor (bottle assumed full at calibration). This avoids depending
+            # on a cap open/close event, which doesn't always register. A real
+            # refill (detected via cap open/close + weight jump) re-anchors at
+            # the true full level later.
+            self.weight_full_raw = raw
+            self.current_fill_ml = self.bottle_size_ml
+            _LOGGER.info("weight calibration: adopted %s as full anchor", raw)
+            return True
+        delta_raw = self.weight_full_raw - raw  # positive when drunk
+        delta_ml = round(delta_raw / RAW_UNITS_PER_ML)
+        new_fill = max(0, min(self.bottle_size_ml, self.bottle_size_ml - delta_ml))
         if new_fill != self.current_fill_ml:
             self.current_fill_ml = new_fill
             return True
@@ -218,8 +233,9 @@ class BottleState:
             self.last_sip = sip
             self.last_seen = sip.timestamp
 
-        # Sip-exceeds-fill: bottle was clearly refilled out-of-band.
-        if self.weight_full_low is None and sip.volume_ml > self.current_fill_ml:
+        # Sip-exceeds-fill: bottle was clearly refilled out-of-band. Only used as
+        # a fallback while we have no weight anchor to track fill directly.
+        if self.weight_full_raw is None and sip.volume_ml > self.current_fill_ml:
             self.current_fill_ml = max(0, self.bottle_size_ml - sip.volume_ml)
             self.last_refill_ts = sip.timestamp
             _LOGGER.info(
@@ -227,7 +243,7 @@ class BottleState:
                 self.current_fill_ml,
                 sip.volume_ml,
             )
-        elif self.weight_full_low is None:
+        elif self.weight_full_raw is None:
             # Sip-decrement fallback while we have no weight anchor.
             self.current_fill_ml = max(0, self.current_fill_ml - sip.volume_ml)
 

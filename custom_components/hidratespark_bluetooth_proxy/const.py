@@ -18,11 +18,9 @@ DEFAULT_NAME_PREFIX: Final = "h2o"
 RECONNECT_BACKOFF_INITIAL: Final = 1.0
 RECONNECT_BACKOFF_MAX: Final = 60.0
 
-# Refill detection tuning (matches upstream bridge)
+# Refill detection tuning
 REFILL_SETTLE_TIMEOUT_S: Final = 30.0
-REFILL_STABLE_SAMPLES: Final = 3
-REFILL_STABLE_TOLERANCE: Final = 2  # raw weight units
-REFILL_MIN_DELTA: Final = 25  # raw units (~mL)
+REFILL_STABLE_SAMPLES: Final = 3  # consecutive steady samples = "settled"
 
 # BLE: services
 SERVICE_USER: Final = "bf2d1ba0-c473-49f2-9571-0ce69036c642"
@@ -52,10 +50,22 @@ DRAIN_BYTE: Final = bytes([0x57])
 # consecutive identical frames to avoid an unbounded write loop.
 MAX_IDENTICAL_SIP_FRAMES: Final = 5
 
-# Weight high-byte meaning
-WEIGHT_HIGH_STABLE: Final = 0x8A  # bottle upright & settled — only reading we trust
-WEIGHT_HIGH_TILTED: Final = 0x84
-WEIGHT_HIGH_TRANSIENT: Final = 0x88
+# Weight encoding.
+# The weight characteristic streams a 16-bit big-endian value (high<<8 | low).
+# Earlier firmwares were assumed to put an orientation flag in the high byte and
+# the weight in the low byte, but on legacy-firmware bottles (e.g. 32oz) the high
+# byte rises *with* the weight (observed 0x8Exx at ~75% full, 0x90xx when full),
+# so the whole u16 is the reading. We therefore treat the full u16 as the weight
+# and detect a trustworthy "upright & settled" reading by stability: N consecutive
+# samples within RAW_STABLE_TOLERANCE. Transient frames while the bottle is moved
+# never form a streak, so they are filtered without needing a magic byte.
+RAW_STABLE_TOLERANCE: Final = 4  # u16 units; settled jitter is ~±1-2
+# Raw-units-per-mL scale for converting a weight delta into a volume. Measured
+# ~2.04 (0x90A4 full vs 0x8EC2 at ~75% on a 946 mL bottle); refine via calibration.
+RAW_UNITS_PER_ML: Final = 2.0
+# A jump of this many u16 units across a cap open/close means the bottle was
+# refilled (~30 mL at the scale above) rather than just opened to drink.
+REFILL_MIN_DELTA_RAW: Final = 60
 
 # 13-step handshake from HydroSync. Each tuple is (target_char, hex_payload).
 # Writes are 50 ms apart.

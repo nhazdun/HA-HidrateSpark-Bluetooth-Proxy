@@ -33,11 +33,10 @@ from .const import (
     HANDSHAKE_COMMANDS,
     HANDSHAKE_INTERVAL_S,
     MAX_IDENTICAL_SIP_FRAMES,
-    REFILL_MIN_DELTA,
+    REFILL_MIN_DELTA_RAW,
     REFILL_SETTLE_TIMEOUT_S,
     REFILL_STABLE_SAMPLES,
-    REFILL_STABLE_TOLERANCE,
-    WEIGHT_HIGH_STABLE,
+    RAW_STABLE_TOLERANCE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -49,7 +48,7 @@ SipCallback = Callable[[float, int, int], Awaitable[None]]
 BatteryCallback = Callable[[int], Awaitable[None]]
 StatusCallback = Callable[[bool, Optional[str]], Awaitable[None]]
 RefillCallback = Callable[[str, Optional[int]], Awaitable[None]]
-"""await on_refill(source, weight_full_low_anchor)."""
+"""await on_refill(source, weight_full_raw_anchor)."""
 
 WeightCallback = Callable[[int, int], Awaitable[None]]
 """await on_weight(raw_u16, low_byte_when_upright)."""
@@ -70,6 +69,7 @@ class BottleClient:
         on_refill: RefillCallback,
         on_weight: WeightCallback,
         ble_device_provider: Callable[[], Optional[BLEDevice]],
+        anchor_exists: Callable[[], bool],
     ) -> None:
         self.address = address.upper().strip()
         self.name = name
@@ -80,6 +80,7 @@ class BottleClient:
         self._on_refill = on_refill
         self._on_weight = on_weight
         self._ble_device_provider = ble_device_provider
+        self._anchor_exists = anchor_exists
 
         self._client: Optional[BleakClient] = None
         self._stop = asyncio.Event()
@@ -93,11 +94,11 @@ class BottleClient:
         self._last_frame_hex: Optional[str] = None
         self._frame_repeat = 0
 
-        # Refill detection state
-        self._weight_stable_low: Optional[int] = None
+        # Refill detection state (16-bit raw weight values)
+        self._weight_stable_raw: Optional[int] = None
         self._weight_stable_streak = 0
-        self._weight_last_low: Optional[int] = None
-        self._pre_open_weight_low: Optional[int] = None
+        self._weight_last_raw: Optional[int] = None
+        self._pre_open_weight_raw: Optional[int] = None
         self._cap_open = False
         self._refill_check_task: Optional[asyncio.Task] = None
 
@@ -375,6 +376,7 @@ class BottleClient:
             _LOGGER.warning("sip handler error: %s", err)
 
     async def _on_cap_notify(self, _char, data: bytearray) -> None:
+        _LOGGER.debug("cap frame raw=%s", data.hex() if data else "<empty>")
         if not self._connected or self._stop.is_set():
             return
         if not data:
@@ -383,8 +385,8 @@ class BottleClient:
         is_open = bool(data[0] & 0x01)
         if is_open and not self._cap_open:
             self._cap_open = True
-            self._pre_open_weight_low = self._weight_stable_low
-            _LOGGER.debug("cap opened (pre=%s)", self._pre_open_weight_low)
+            self._pre_open_weight_raw = self._weight_stable_raw
+            _LOGGER.debug("cap opened (pre=%s)", self._pre_open_weight_raw)
         elif not is_open and self._cap_open:
             self._cap_open = False
             _LOGGER.debug("cap closed; scheduling refill check")
@@ -397,30 +399,27 @@ class BottleClient:
             return
         if len(data) < 2:
             return
-        high = data[0]
-        low = data[1]
-        raw = (high << 8) | low
+        # The full 16-bit big-endian value is the weight; it rises as the bottle
+        # fills. There is no reliable orientation flag, so a trustworthy "upright
+        # & settled" reading is identified purely by stability: N consecutive
+        # samples within tolerance. Frames emitted while the bottle is moved jump
+        # around and never form a streak, so they are filtered out here.
+        raw = (data[0] << 8) | data[1]
+        _LOGGER.debug("weight frame raw=%s (u16=%d)", data.hex(), raw)
 
-        if high != WEIGHT_HIGH_STABLE:
-            # Tilted/transient — useful only to invalidate stability streak.
-            self._weight_last_low = None
-            self._weight_stable_streak = 0
-            return
-
-        # Track stability: 3 consecutive samples within ±tolerance.
         if (
-            self._weight_last_low is not None
-            and abs(low - self._weight_last_low) <= REFILL_STABLE_TOLERANCE
+            self._weight_last_raw is not None
+            and abs(raw - self._weight_last_raw) <= RAW_STABLE_TOLERANCE
         ):
             self._weight_stable_streak += 1
         else:
             self._weight_stable_streak = 1
-        self._weight_last_low = low
+        self._weight_last_raw = raw
 
         if self._weight_stable_streak >= REFILL_STABLE_SAMPLES:
-            self._weight_stable_low = low
+            self._weight_stable_raw = raw
             try:
-                await self._on_weight(raw, low)
+                await self._on_weight(raw, raw)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning("weight handler error: %s", err)
 
@@ -431,27 +430,26 @@ class BottleClient:
         if self._stop.is_set():
             return
         deadline = time.monotonic() + REFILL_SETTLE_TIMEOUT_S
-        baseline = self._pre_open_weight_low
+        baseline = self._pre_open_weight_raw
         try:
             while time.monotonic() < deadline:
                 await asyncio.sleep(1.0)
                 if self._stop.is_set():
                     return
-                post = self._weight_stable_low
+                post = self._weight_stable_raw
                 if post is None:
                     continue
-                if baseline is None:
-                    # No pre-open snapshot — don't declare a refill, just
-                    # adopt this reading as the calibration anchor so that
-                    # subsequent fill calculations work. (Avoids a spurious
-                    # refill on the very first cap-close after install.)
-                    _LOGGER.debug(
-                        "refill check: no pre-open baseline; adopting %s as anchor",
-                        post,
+                if baseline is None or not self._anchor_exists():
+                    # No usable baseline, or no full-weight anchor established
+                    # yet, so adopt this settled reading as the calibration
+                    # anchor (bottle assumed full) so subsequent fill maths work.
+                    # Not counted as a refill.
+                    _LOGGER.info(
+                        "calibration: adopting %s as full-weight anchor", post
                     )
                     await self._on_refill("calibration", post)
                     return
-                if post - baseline >= REFILL_MIN_DELTA:
+                if post - baseline >= REFILL_MIN_DELTA_RAW:
                     _LOGGER.info(
                         "REFILL detected: pre=%s post=%s delta=%s",
                         baseline,

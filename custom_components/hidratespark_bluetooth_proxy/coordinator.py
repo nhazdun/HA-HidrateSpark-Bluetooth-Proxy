@@ -78,6 +78,7 @@ class HidrateSparkCoordinator:
             on_refill=self._handle_refill,
             on_weight=self._handle_weight,
             ble_device_provider=self._get_ble_device,
+            anchor_exists=lambda: self.state.weight_full_raw is not None,
         )
 
         # Wake the BLE loop whenever HA sees a fresh advertisement for the bottle.
@@ -149,16 +150,21 @@ class HidrateSparkCoordinator:
         self.last_error = error
         self._notify()
 
-    async def _handle_refill(self, source: str, weight_full_low: Optional[int]) -> None:
-        self.state.refill(source, weight_full_low)
+    async def _handle_refill(self, source: str, weight_full_raw: Optional[int]) -> None:
+        self.state.refill(source, weight_full_raw)
         await self.state.async_save()
         self._notify()
 
-    async def _handle_weight(self, _raw: int, low_byte: int) -> None:
-        if self.state.update_fill_from_weight(low_byte):
+    async def _handle_weight(self, raw: int, _low_byte: int) -> None:
+        fill_changed = self.state.update_fill_from_weight(raw)
+        if fill_changed:
             # Persist sparingly — fill changes happen often. Only on real change.
             await self.state.async_save()
-            self._notify()
+        # Always notify so the live raw-weight reading refreshes even before a
+        # calibration anchor exists (update_fill_from_weight returns False once
+        # an anchor is set and fill is unchanged, but it still records the
+        # latest stable raw reading).
+        self._notify()
 
     @callback
     def _notify(self) -> None:

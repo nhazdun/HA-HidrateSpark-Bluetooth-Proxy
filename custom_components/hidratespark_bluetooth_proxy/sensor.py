@@ -137,7 +137,7 @@ class HidrateSparkSensor(HidrateSparkEntity, SensorEntity):
         if key == "refills_today":
             return state.refills_today
         if key == "weight_raw":
-            return state.weight_low
+            return state.weight_raw
         return None
 
     @property
