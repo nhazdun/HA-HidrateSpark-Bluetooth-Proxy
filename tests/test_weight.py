@@ -19,12 +19,20 @@ class WeightCalibrationTest(unittest.TestCase):
         self.assertEqual(b.weight_full_raw, 37000)
         self.assertEqual(b.current_fill_ml, 946)
 
-    def test_fill_tracks_down_from_anchor(self):
+    def test_empty_bottle_reads_zero(self):
+        # Measured full+empty calibration on a 946 mL bottle.
         b = new_bottle(946)
-        b.update_fill_from_weight(37000)  # anchor at full
-        b.update_fill_from_weight(36000)  # 1000 raw units lower
-        # scale ~2.0 raw/mL -> ~500 mL drunk
-        self.assertAlmostEqual(b.current_fill_ml, 446, delta=5)
+        b.update_fill_from_weight(37115)  # full anchor
+        self.assertEqual(b.current_fill_ml, 946)
+        b.update_fill_from_weight(35880)  # truly empty
+        self.assertAlmostEqual(b.current_fill_ml, 0, delta=20)
+
+    def test_fill_tracks_proportionally(self):
+        b = new_bottle(946)
+        b.update_fill_from_weight(37115)  # full
+        # halfway down the raw span (1235 units) -> ~half the bottle drunk
+        b.update_fill_from_weight(37115 - 1235 // 2)
+        self.assertAlmostEqual(b.current_fill_ml, 473, delta=15)
 
     def test_fill_never_exceeds_full_or_goes_negative(self):
         b = new_bottle(946)

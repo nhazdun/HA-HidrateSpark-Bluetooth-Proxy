@@ -61,8 +61,10 @@ MAX_IDENTICAL_SIP_FRAMES: Final = 5
 # never form a streak, so they are filtered without needing a magic byte.
 RAW_STABLE_TOLERANCE: Final = 4  # u16 units; settled jitter is ~±1-2
 # Raw-units-per-mL scale for converting a weight delta into a volume. Measured
-# ~2.04 (0x90A4 full vs 0x8EC2 at ~75% on a 946 mL bottle); refine via calibration.
-RAW_UNITS_PER_ML: Final = 2.0
+# from a full+empty calibration on a 946 mL bottle: full u16 = 37115, empty
+# u16 = 35880, so 1235 raw units span 946 mL = ~1.305 raw/mL. This is a load-cell
+# property, so it should hold across bottle sizes on the same puck.
+RAW_UNITS_PER_ML: Final = 1.305
 # A jump of this many u16 units across a cap open/close means the bottle was
 # refilled (~30 mL at the scale above) rather than just opened to drink.
 REFILL_MIN_DELTA_RAW: Final = 60
