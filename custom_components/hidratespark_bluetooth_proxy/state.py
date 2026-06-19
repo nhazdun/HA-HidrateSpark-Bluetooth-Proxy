@@ -75,8 +75,11 @@ class BottleState:
         self._sips_today: int = 0
         self._refills_today: int = 0
 
-        # Weight calibration: 16-bit raw weight value at "full".
+        # Weight calibration (16-bit raw values). "full" is the bootstrap/refill
+        # anchor; "empty" is the learned tare (lightest settled reading), which
+        # is the stable zero reference fill is measured up from.
         self.weight_full_raw: Optional[int] = None
+        self.weight_empty_raw: Optional[int] = None
         self.weight_raw: Optional[int] = None  # most recent stable u16 reading
 
     # ----------------------------------------------------------- persistence
@@ -91,6 +94,7 @@ class BottleState:
         self._sips_today = int(data.get("sips_today") or 0)
         self._refills_today = int(data.get("refills_today") or 0)
         self.weight_full_raw = data.get("weight_full_raw")
+        self.weight_empty_raw = data.get("weight_empty_raw")
 
         # Restore the recent-sip dedup window. Without this, a HA restart
         # empties the dedup history, and the bottle's initial drain replays its
@@ -118,6 +122,7 @@ class BottleState:
                 "sips_today": self._sips_today,
                 "refills_today": self._refills_today,
                 "weight_full_raw": self.weight_full_raw,
+                "weight_empty_raw": self.weight_empty_raw,
                 # Persist the dedup window so replays after a restart are
                 # recognised as duplicates rather than re-counted.
                 "recent_sips": [
@@ -178,24 +183,48 @@ class BottleState:
     def update_fill_from_weight(self, raw: int) -> bool:
         """Recompute current fill from a stable upright 16-bit weight reading.
 
-        The reading rises with the water level, so the drop from the "full"
-        anchor, scaled by RAW_UNITS_PER_ML, gives how much has been drunk.
-        Returns True if current_fill_ml changed.
+        Fill is measured up from the bottle's empty weight (tare), not down from
+        the "full" anchor: the tare is stable per bottle, whereas "full" varies
+        with how full it was actually filled, so anchoring on it leaves phantom
+        volume at empty. The tare is learned as the lightest settled reading
+        seen; until a real drain has been observed we fall back to estimating
+        down from the full anchor so a freshly-set-up (full) bottle still reads
+        sensibly. Returns True if current_fill_ml changed.
         """
         self.weight_raw = raw
         if self.weight_full_raw is None:
             # Bootstrap: the first settled reading establishes the full-weight
-            # anchor (bottle assumed full at calibration). This avoids depending
-            # on a cap open/close event, which doesn't always register. A real
-            # refill (detected via cap open/close + weight jump) re-anchors at
-            # the true full level later.
+            # anchor (bottle assumed full at calibration). A real refill
+            # (cap open/close + weight jump) re-anchors at the true full later.
             self.weight_full_raw = raw
             self.current_fill_ml = self.bottle_size_ml
             _LOGGER.info("weight calibration: adopted %s as full anchor", raw)
             return True
-        delta_raw = self.weight_full_raw - raw  # positive when drunk
-        delta_ml = round(delta_raw / RAW_UNITS_PER_ML)
-        new_fill = max(0, min(self.bottle_size_ml, self.bottle_size_ml - delta_ml))
+
+        full_span = RAW_UNITS_PER_ML * self.bottle_size_ml
+        # Learn the empty floor (tare) as the lightest settled reading. Only
+        # accept candidates that are plausibly below the full anchor but not more
+        # than a bottle's worth below it (which would be the bottle lifted off
+        # the puck rather than genuinely empty).
+        if (
+            self.weight_full_raw - 1.3 * full_span <= raw < self.weight_full_raw
+            and (self.weight_empty_raw is None or raw < self.weight_empty_raw)
+        ):
+            self.weight_empty_raw = raw
+
+        if (
+            self.weight_empty_raw is not None
+            and self.weight_full_raw - self.weight_empty_raw >= 0.6 * full_span
+        ):
+            # Enough range observed: measure up from the learned empty floor, so
+            # empty reads 0 regardless of how full the last fill actually was.
+            new_fill = round((raw - self.weight_empty_raw) / RAW_UNITS_PER_ML)
+        else:
+            # Not drained enough yet to trust the floor: estimate down from full.
+            new_fill = self.bottle_size_ml - round(
+                (self.weight_full_raw - raw) / RAW_UNITS_PER_ML
+            )
+        new_fill = max(0, min(self.bottle_size_ml, new_fill))
         if new_fill != self.current_fill_ml:
             self.current_fill_ml = new_fill
             return True
