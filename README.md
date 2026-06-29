@@ -1,6 +1,14 @@
 # HidrateSpark — Home Assistant integration
 
-[![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/)
+[![HACS](https://img.shields.io/badge/HACS-Custom-41BDF5?style=flat-square)](https://github.com/hacs/integration)
+[![Release](https://img.shields.io/github/v/release/loryanstrant/HA-HidrateSpark-Bluetooth-Proxy?style=flat-square)](https://github.com/loryanstrant/HA-HidrateSpark-Bluetooth-Proxy/releases)
+[![Release date](https://img.shields.io/github/release-date/loryanstrant/HA-HidrateSpark-Bluetooth-Proxy?style=flat-square)](https://github.com/loryanstrant/HA-HidrateSpark-Bluetooth-Proxy/releases)
+[![Downloads](https://img.shields.io/github/downloads/loryanstrant/HA-HidrateSpark-Bluetooth-Proxy/total?style=flat-square)](https://github.com/loryanstrant/HA-HidrateSpark-Bluetooth-Proxy/releases)
+[![License](https://img.shields.io/github/license/loryanstrant/HA-HidrateSpark-Bluetooth-Proxy?style=flat-square)](LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/loryanstrant/HA-HidrateSpark-Bluetooth-Proxy?style=flat-square)](https://github.com/loryanstrant/HA-HidrateSpark-Bluetooth-Proxy/commits)
+[![Stars](https://img.shields.io/github/stars/loryanstrant/HA-HidrateSpark-Bluetooth-Proxy?style=flat-square)](https://github.com/loryanstrant/HA-HidrateSpark-Bluetooth-Proxy/stargazers)
+
+[![Open in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=loryanstrant&repository=HA-HidrateSpark-Bluetooth-Proxy&category=integration)
 
 A native Home Assistant integration for HidrateSpark smart water bottles.
 Connects via Bluetooth — local adapter **or an ESPHome Bluetooth proxy** — and
