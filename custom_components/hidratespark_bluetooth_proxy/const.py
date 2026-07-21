@@ -10,6 +10,7 @@ DOMAIN: Final = "hidratespark_bluetooth_proxy"
 CONF_ADDRESS: Final = "address"
 CONF_SIZE_ML: Final = "size_ml"
 CONF_NAME_PREFIX: Final = "name_prefix"
+CONF_DEVICE_ID: Final = "device_id"
 
 DEFAULT_SIZE_ML: Final = 591
 DEFAULT_NAME_PREFIX: Final = "h2o"
