@@ -19,9 +19,12 @@ class HidrateSparkEntity(Entity):
 
     def __init__(self, coordinator: HidrateSparkCoordinator, key: str) -> None:
         self._coordinator = coordinator
-        self._attr_unique_id = f"{coordinator.address}_{key}"
+        # Key entity + device identity on the stable device_id (survives MAC
+        # rotation) and fall back to the address only if no stable id exists.
+        stable = getattr(coordinator, "device_id", "") or coordinator.address
+        self._attr_unique_id = f"{stable}_{key}"
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, coordinator.address)},
+            identifiers={(DOMAIN, stable)},
             connections={(CONNECTION_BLUETOOTH, coordinator.address)},
             name=coordinator.name or "HidrateSpark",
             manufacturer="HidrateSpark",
