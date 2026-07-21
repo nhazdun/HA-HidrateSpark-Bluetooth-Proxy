@@ -1,11 +1,18 @@
 """Config flow for the HidrateSpark integration.
 
+Binding is keyed on a *stable* identifier (the bottle's advertised local name,
+e.g. "h2o1a2b3c") instead of the Bluetooth MAC address. HidrateSpark bottles
+rotate their BLE MAC for privacy, which previously caused Home Assistant to
+lose the binding and require re-pairing. By using the stable name as the config
+entry unique_id we keep a single device across MAC rotations, and we transparently
+refresh the stored MAC whenever the same bottle is re-discovered at a new address.
+
 Discovery sources:
-  * Bluetooth — when HA's bluetooth stack (or an ESPHome proxy) sees a bottle
-    advertising the HydroSync reference service or a `h2o*` local name, the
+  * Bluetooth - when HA's bluetooth stack (or an ESPHome proxy) sees a bottle
+    advertising the HydroSync reference service or a "h2o*" local name, the
     user is offered a one-click "Configure" action.
-  * Manual — the user picks from any HidrateSpark candidate currently
-    advertising in range, or types a MAC address directly.
+  * Manual - the user picks from any HidrateSpark candidate currently
+    advertising in range.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ from homeassistant.core import callback
 from homeassistant.helpers import config_validation as cv
 
 from .const import (
+    CONF_DEVICE_ID,
     CONF_NAME_PREFIX,
     CONF_SIZE_ML,
     DEFAULT_NAME_PREFIX,
@@ -44,10 +52,23 @@ def _looks_like_bottle(info: BluetoothServiceInfoBleak) -> bool:
     return False
 
 
+def _stable_id(info: BluetoothServiceInfoBleak) -> str:
+    """Return a MAC-independent identifier for a bottle.
+
+    HidrateSpark advertises a persistent local name (e.g. "h2o1a2b3c"). We use
+    that as the durable key. If for some reason no name is advertised we fall
+    back to the MAC so the flow still works, but the whole point is to prefer
+    the stable name whenever it is available.
+    """
+    if info.name:
+        return info.name.strip().lower()
+    return info.address.upper()
+
+
 class HidrateSparkConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for HidrateSpark."""
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self) -> None:
         self._discovery_info: BluetoothServiceInfoBleak | None = None
@@ -59,10 +80,17 @@ class HidrateSparkConfigFlow(ConfigFlow, domain=DOMAIN):
         self, discovery_info: BluetoothServiceInfoBleak
     ) -> FlowResult:
         """Handle a bottle discovered via the bluetooth integration."""
-        await self.async_set_unique_id(discovery_info.address)
-        self._abort_if_unique_id_configured()
         if not _looks_like_bottle(discovery_info):
             return self.async_abort(reason="not_supported")
+
+        device_id = _stable_id(discovery_info)
+        await self.async_set_unique_id(device_id)
+        # If we already know this bottle, transparently refresh its (possibly
+        # rotated) MAC address so the connection keeps working - no re-pairing.
+        self._abort_if_unique_id_configured(
+            updates={CONF_ADDRESS: discovery_info.address}
+        )
+
         self._discovery_info = discovery_info
         self.context["title_placeholders"] = {
             "name": discovery_info.name or discovery_info.address,
@@ -73,21 +101,19 @@ class HidrateSparkConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         assert self._discovery_info is not None
+        info = self._discovery_info
         if user_input is not None:
             return self.async_create_entry(
-                title=self._discovery_info.name
-                or self._discovery_info.address,
+                title=info.name or info.address,
                 data={
-                    CONF_ADDRESS: self._discovery_info.address,
+                    CONF_ADDRESS: info.address,
+                    CONF_DEVICE_ID: _stable_id(info),
                     CONF_NAME_PREFIX: DEFAULT_NAME_PREFIX,
                 },
                 options={CONF_SIZE_ML: user_input.get(CONF_SIZE_ML, DEFAULT_SIZE_ML)},
             )
         return self.async_show_form(
             step_id="bluetooth_confirm",
-            description_placeholders={
-                "name": self._discovery_info.name or self._discovery_info.address,
-            },
             data_schema=vol.Schema(
                 {
                     vol.Required(CONF_SIZE_ML, default=DEFAULT_SIZE_ML): vol.All(
@@ -95,6 +121,9 @@ class HidrateSparkConfigFlow(ConfigFlow, domain=DOMAIN):
                     ),
                 }
             ),
+            description_placeholders={
+                "name": info.name or info.address,
+            },
         )
 
     # ---------------------------------------------------------------- user flow
@@ -102,54 +131,56 @@ class HidrateSparkConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Handle a manually-initiated flow."""
+        """Manual setup: pick from bottles currently advertising in range."""
         if user_input is not None:
-            address = user_input[CONF_ADDRESS].upper()
-            await self.async_set_unique_id(address)
-            self._abort_if_unique_id_configured()
-            title = self._discovered.get(address)
+            address = user_input[CONF_ADDRESS]
+            info = self._discovered.get(address)
+            device_id = _stable_id(info) if info else address.upper()
+
+            await self.async_set_unique_id(device_id)
+            self._abort_if_unique_id_configured(
+                updates={CONF_ADDRESS: address}
+            )
+
+            title = info.name if info and info.name else address
             return self.async_create_entry(
-                title=(title.name if title and title.name else address),
+                title=title,
                 data={
                     CONF_ADDRESS: address,
+                    CONF_DEVICE_ID: device_id,
                     CONF_NAME_PREFIX: DEFAULT_NAME_PREFIX,
                 },
                 options={CONF_SIZE_ML: user_input.get(CONF_SIZE_ML, DEFAULT_SIZE_ML)},
             )
 
-        # Build a picker from currently-advertising candidates.
-        current_addresses = {
+        # Build a picker from currently-advertising candidates, skipping ones we
+        # already track (matched by stable id, not MAC).
+        current_ids = {
             entry.unique_id for entry in self._async_current_entries()
         }
+        self._discovered = {}
         for info in async_discovered_service_info(self.hass):
-            if info.address in current_addresses:
+            if not _looks_like_bottle(info):
                 continue
-            if _looks_like_bottle(info):
-                self._discovered[info.address] = info
+            if _stable_id(info) in current_ids:
+                continue
+            self._discovered[info.address] = info
 
-        if self._discovered:
-            choices = {
-                addr: f"{(info.name or addr)} ({addr})"
-                for addr, info in self._discovered.items()
+        if not self._discovered:
+            return self.async_abort(reason="no_devices_found")
+
+        choices = {
+            addr: f"{(info.name or addr)} ({addr})"
+            for addr, info in self._discovered.items()
+        }
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_ADDRESS): vol.In(choices),
+                vol.Required(CONF_SIZE_ML, default=DEFAULT_SIZE_ML): vol.All(
+                    cv.positive_int, vol.Range(min=100, max=2000)
+                ),
             }
-            schema = vol.Schema(
-                {
-                    vol.Required(CONF_ADDRESS): vol.In(choices),
-                    vol.Required(CONF_SIZE_ML, default=DEFAULT_SIZE_ML): vol.All(
-                        cv.positive_int, vol.Range(min=100, max=2000)
-                    ),
-                }
-            )
-        else:
-            schema = vol.Schema(
-                {
-                    vol.Required(CONF_ADDRESS): str,
-                    vol.Required(CONF_SIZE_ML, default=DEFAULT_SIZE_ML): vol.All(
-                        cv.positive_int, vol.Range(min=100, max=2000)
-                    ),
-                }
-            )
-
+        )
         return self.async_show_form(step_id="user", data_schema=schema)
 
     # ----------------------------------------------------------------- options
